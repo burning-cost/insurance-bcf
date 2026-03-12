@@ -75,7 +75,7 @@ _REPORT_TEMPLATE = """<!DOCTYPE html>
   <strong>Engine:</strong> stochtree BCFModel (Herren, Hahn, Murray, Carvalho 2025/2026)<br>
   <strong>Outcome type:</strong> {{ outcome }}<br>
   <strong>MCMC samples:</strong> {{ num_mcmc }}<br>
-  <strong>Training policies:</strong> {{ n_train:,}}<br>
+  <strong>Training policies:</strong> {{ "{:,}".format(n_train) }}<br>
   <strong>Features:</strong> {{ n_features }}
 </div>
 

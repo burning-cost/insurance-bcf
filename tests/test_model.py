@@ -206,10 +206,12 @@ class TestFitSuccess:
         model.fit(data.X, data.treatment, data.outcome, propensity=pi)
         assert model._is_fitted
 
-    def test_fit_with_groups(self):
+    def test_fit_with_groups_accepted(self):
+        """groups parameter is accepted (reserved for future rfx support)."""
         rng = np.random.default_rng(0)
         groups = pd.Series(rng.integers(1, 4, len(self.data.X)), name="insurer_id")
         model = _make_model()
+        # groups is accepted but not passed to stochtree (requires rfx_basis)
         model.fit(self.data.X, self.data.treatment, self.data.outcome,
                   propensity=self.pi, groups=groups)
         assert model._is_fitted

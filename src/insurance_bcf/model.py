@@ -14,6 +14,15 @@ unexplained variance to the treatment effect. This is the central BCF
 innovation from Hahn, Murray, Carvalho (2020) Bayesian Analysis 15(3).
 
 Reference: Herren et al. (2025/2026) arXiv:2512.12051v2 — stochtree paper.
+
+stochtree API notes (v0.4.0):
+- BCFModel.predict() requires propensity if propensity was passed to sample().
+  We always pass propensity to sample(), so we must pass it to predict() too.
+  For predict, we use the training propensity (mean) as a reasonable default
+  when predicting on training data, or None if the user can provide their own.
+- BCFModel.from_json() takes json_string= as a keyword argument.
+- rfx_group_ids_train requires rfx_basis_train — we don't support random effects
+  without a basis matrix. The groups parameter is reserved for future use.
 """
 
 from __future__ import annotations
@@ -178,6 +187,8 @@ class BayesianCausalForest:
         self._propensity_train: npt.NDArray[np.float64] | None = None
         self._n_train: int = 0
         self._BCFModelClass = _get_bcf_model_class()
+        # Track whether we're using the mock (for API routing)
+        self._using_mock: bool = False
 
     # ------------------------------------------------------------------
     # fit
@@ -212,8 +223,8 @@ class BayesianCausalForest:
             propensity is preferred for insurance applications where you can
             encode domain knowledge about treatment assignment.
         groups : pd.Series or None
-            Group labels for random effects (e.g. insurer ID, region). Must be
-            integer-coded starting at 1. Shape (n_policies,).
+            Reserved for future random effects support. Currently unused in
+            the stochtree call (requires rfx_basis_train which we don't support).
         gipp_date_col : str or None
             If provided, the name of a date column in X to check for GIPP break.
             Issues GIPPBreakWarning if data spans January 2022.
@@ -260,16 +271,21 @@ class BayesianCausalForest:
             "max_depth": 5,
         }
 
-        rfx_group_ids = np.asarray(groups, dtype=int) if groups is not None else None
+        # Determine if we're using real stochtree or mock
+        BCFModelClass = self._BCFModelClass
+        try:
+            from stochtree.bcf import BCFModel as _RealBCFModel  # type: ignore[import-untyped]
+            self._using_mock = BCFModelClass is not _RealBCFModel
+        except ImportError:
+            self._using_mock = True
 
         # Instantiate and sample
-        self._bcf_model = self._BCFModelClass()
-        self._bcf_model.sample(
+        self._bcf_model = BCFModelClass()
+        sample_kwargs: dict = dict(
             X_train=X_arr,
             Z_train=Z_arr,
             y_train=y_arr,
             propensity_train=pi_hat,
-            rfx_group_ids_train=rfx_group_ids,
             num_gfr=self.num_gfr,
             num_burnin=self.num_burnin,
             num_mcmc=self.num_mcmc,
@@ -277,6 +293,10 @@ class BayesianCausalForest:
             prognostic_forest_params=prognostic_params,
             treatment_effect_forest_params=treatment_params,
         )
+        # Note: rfx_group_ids_train requires rfx_basis_train in stochtree 0.4.0
+        # Random effects are not passed until we support the full basis interface
+
+        self._bcf_model.sample(**sample_kwargs)
 
         self._feature_names = list(X.columns)
         self._n_train = len(y_arr)
@@ -297,6 +317,7 @@ class BayesianCausalForest:
         X: pd.DataFrame,
         treatment_value: float = 1.0,
         credible_level: float = 0.95,
+        propensity: npt.ArrayLike | None = None,
     ) -> pd.DataFrame:
         """
         Compute posterior CATE estimates with credible intervals.
@@ -313,6 +334,10 @@ class BayesianCausalForest:
             Treatment level for which to compute CATE. Default 1.0 (binary).
         credible_level : float
             Posterior credible interval level. Default 0.95.
+        propensity : array-like or None
+            Propensity scores for X. If None and using real stochtree,
+            falls back to mean training propensity (constant). Provide
+            for more accurate predictions on new data.
 
         Returns
         -------
@@ -324,24 +349,7 @@ class BayesianCausalForest:
         X_arr = self._validate_features(X)
         Z_arr = np.full(len(X_arr), treatment_value)
 
-        preds = self._bcf_model.predict(
-            X=X_arr,
-            Z=Z_arr,
-            type="posterior",
-            terms="cate",
-        )
-        # stochtree returns dict with 'cate' key when terms='cate'
-        # Shape: (n, n_mcmc_samples)
-        if isinstance(preds, dict):
-            tau_posterior = preds.get("cate", preds.get("tau", None))
-        else:
-            tau_posterior = preds
-
-        if tau_posterior is None:
-            raise RuntimeError(
-                "stochtree predict() did not return CATE samples. "
-                "Check the stochtree version and terms parameter."
-            )
+        tau_posterior = self._get_tau_posterior(X_arr, Z_arr, propensity)
 
         alpha = (1.0 - credible_level) / 2.0
         return pd.DataFrame(
@@ -363,6 +371,7 @@ class BayesianCausalForest:
         X: pd.DataFrame,
         treatment_value: float = 1.0,
         marginalise_probit: bool = False,
+        propensity: npt.ArrayLike | None = None,
     ) -> npt.NDArray[np.float64]:
         """
         Return raw posterior draws over tau(x).
@@ -376,9 +385,9 @@ class BayesianCausalForest:
         marginalise_probit : bool
             If True and outcome=='binary', apply the standard normal CDF to
             convert latent probit tau to approximate probability-scale effects.
-            This is an approximation: the exact marginalisation integrates
-            mu(x) + tau(x)*z out, which requires the mu posterior as well.
             Default False (return latent scale).
+        propensity : array-like or None
+            Propensity scores for X. If None, uses mean training propensity.
 
         Returns
         -------
@@ -389,23 +398,72 @@ class BayesianCausalForest:
         X_arr = self._validate_features(X)
         Z_arr = np.full(len(X_arr), treatment_value)
 
-        preds = self._bcf_model.predict(
-            X=X_arr,
-            Z=Z_arr,
-            type="posterior",
-            terms="cate",
-        )
+        tau_posterior = self._get_tau_posterior(X_arr, Z_arr, propensity)
+
+        if marginalise_probit and self.outcome == "binary":
+            from scipy.stats import norm  # type: ignore[import-untyped]
+            tau_posterior = norm.cdf(tau_posterior)
+
+        return np.asarray(tau_posterior, dtype=float)
+
+    # ------------------------------------------------------------------
+    # Internal: get tau posterior from stochtree
+    # ------------------------------------------------------------------
+
+    def _get_tau_posterior(
+        self,
+        X_arr: npt.NDArray[np.float64],
+        Z_arr: npt.NDArray[np.float64],
+        propensity: npt.ArrayLike | None,
+    ) -> npt.NDArray[np.float64]:
+        """
+        Call stochtree predict() and extract tau posterior.
+
+        stochtree 0.4.0 requires propensity to be passed to predict() when
+        it was passed to sample(). We always pass propensity to sample(), so
+        we must always pass it here.
+
+        When predicting on new data without user-supplied propensity, we use
+        the mean training propensity as a constant. This is a simplification —
+        for production use, compute an appropriate propensity for the new data.
+        """
+        if self._using_mock:
+            # Mock doesn't need propensity in predict
+            preds = self._bcf_model.predict(X=X_arr, Z=Z_arr, type="posterior", terms="cate")
+        else:
+            # Real stochtree: must pass propensity
+            if propensity is not None:
+                pi = np.asarray(propensity, dtype=float)
+            elif self._propensity_train is not None:
+                # Use mean training propensity as constant for new data
+                pi = np.full(len(X_arr), float(self._propensity_train.mean()))
+            else:
+                pi = np.full(len(X_arr), 0.5)
+
+            try:
+                preds = self._bcf_model.predict(
+                    X=X_arr,
+                    Z=Z_arr,
+                    propensity=pi,
+                    type="posterior",
+                    terms="cate",
+                )
+            except TypeError:
+                # Fallback: older stochtree may not accept propensity in predict
+                preds = self._bcf_model.predict(X=X_arr, Z=Z_arr, type="posterior", terms="cate")
+
+        # stochtree returns dict with 'cate' key when terms='cate'
+        # Shape: (n, n_mcmc_samples)
         if isinstance(preds, dict):
             tau_posterior = preds.get("cate", preds.get("tau", None))
         else:
             tau_posterior = preds
 
         if tau_posterior is None:
-            raise RuntimeError("stochtree predict() did not return CATE samples.")
-
-        if marginalise_probit and self.outcome == "binary":
-            from scipy.stats import norm  # type: ignore[import-untyped]
-            tau_posterior = norm.cdf(tau_posterior)
+            raise RuntimeError(
+                "stochtree predict() did not return CATE samples. "
+                "Check the stochtree version and terms parameter."
+            )
 
         return np.asarray(tau_posterior, dtype=float)
 
@@ -492,10 +550,22 @@ class BayesianCausalForest:
             Any constructor kwargs to restore on the wrapper.
         """
         BCFModelClass = _get_bcf_model_class()
-        bcf_model = BCFModelClass.from_json(json_str)
+        # stochtree 0.4.0 BCFModel.from_json() takes json_string= as keyword
+        # MockBCFModel.from_json() takes positional str
+        try:
+            bcf_model = BCFModelClass.from_json(json_string=json_str)
+        except TypeError:
+            # Fallback for mock or older API
+            bcf_model = BCFModelClass.from_json(json_str)
         obj = cls(outcome=outcome, **kwargs)
         obj._bcf_model = bcf_model
         obj._is_fitted = True
+        # Determine mock status
+        try:
+            from stochtree.bcf import BCFModel as _RealBCFModel  # type: ignore[import-untyped]
+            obj._using_mock = BCFModelClass is not _RealBCFModel
+        except ImportError:
+            obj._using_mock = True
         return obj
 
     # ------------------------------------------------------------------
@@ -600,16 +670,14 @@ class BayesianCausalForest:
             pi = lr.predict_proba(X_scaled)[:, 1].astype(float)
         else:
             # Continuous treatment: use Gaussian approximation via OLS residuals
-            # P(Z <= z) estimated via standard normal CDF of standardised residuals
             from sklearn.linear_model import Ridge  # type: ignore[import-untyped]
 
-            ridge = Ridge(alpha=1.0, random_state=self.random_seed if self.random_seed is not None else None)
+            ridge = Ridge(alpha=1.0)
             ridge.fit(X_scaled, Z_arr)
             z_pred = ridge.predict(X_scaled)
             residuals = Z_arr - z_pred
             sigma = np.std(residuals) + 1e-8
             from scipy.stats import norm  # type: ignore[import-untyped]
-            # Propensity approximation: P(Z > median | X) via normal CDF
             z_median = np.median(Z_arr)
             pi = norm.cdf((z_pred - z_median) / sigma)
             pi = np.clip(pi, 0.01, 0.99)
