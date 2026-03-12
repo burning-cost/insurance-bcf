@@ -194,9 +194,11 @@ class MockBCFModel:
         return self._json_str
 
     @classmethod
-    def from_json(cls, json_str: str) -> "MockBCFModel":
+    def from_json(cls, json_str: str | None = None, json_string: str | None = None) -> "MockBCFModel":
+        """Support both calling conventions: from_json(str) and from_json(json_string=str)."""
+        actual_str = json_str or json_string or '{}'
         obj = cls()
-        obj._json_str = json_str
+        obj._json_str = actual_str
         obj._sampled = True
         obj._n_mcmc = 100
         obj._sigma2 = np.abs(np.random.normal(0.1, 0.02, 100))

@@ -550,13 +550,28 @@ class BayesianCausalForest:
             Any constructor kwargs to restore on the wrapper.
         """
         BCFModelClass = _get_bcf_model_class()
-        # stochtree 0.4.0 BCFModel.from_json() takes json_string= as keyword
-        # MockBCFModel.from_json() takes positional str
+        # stochtree 0.4.0 BCFModel.from_json() is an instance method:
+        #   instance = BCFModel()
+        #   instance.from_json(json_string=json_str)
+        # This is unusual but reflects the stochtree implementation.
+        # Try multiple calling conventions for robustness.
+        instance = BCFModelClass()
         try:
-            bcf_model = BCFModelClass.from_json(json_string=json_str)
+            # Instance method with keyword arg (stochtree 0.4.0 real API)
+            instance.from_json(json_string=json_str)
+            bcf_model = instance
         except TypeError:
-            # Fallback for mock or older API
-            bcf_model = BCFModelClass.from_json(json_str)
+            try:
+                # Instance method with positional arg
+                instance.from_json(json_str)
+                bcf_model = instance
+            except TypeError:
+                try:
+                    # Class/static method with keyword arg
+                    bcf_model = BCFModelClass.from_json(json_string=json_str)
+                except TypeError:
+                    # Class/static method with positional arg (mock)
+                    bcf_model = BCFModelClass.from_json(json_str)
         obj = cls(outcome=outcome, **kwargs)
         obj._bcf_model = bcf_model
         obj._is_fitted = True
