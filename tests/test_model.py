@@ -16,6 +16,13 @@ from insurance_bcf import (
 from insurance_bcf.simulate import SimulationParams, simulate_renewal, simulate_continuous_outcome
 
 
+def _make_model(**kwargs) -> BayesianCausalForest:
+    """Test helper: BayesianCausalForest with loose positivity for small synthetic datasets."""
+    defaults = dict(num_mcmc=20, num_gfr=3, random_seed=0, positivity_max_fraction=0.30)
+    defaults.update(kwargs)
+    return BayesianCausalForest(**defaults)
+
+
 # ------------------------------------------------------------------
 # Constructor
 # ------------------------------------------------------------------
@@ -158,60 +165,60 @@ class TestFitValidation:
 class TestFitSuccess:
     def setup_method(self):
         self.data = simulate_renewal(SimulationParams(n_policies=150, random_seed=42))
+        # Use ground-truth propensity to avoid positivity issues on small datasets
+        self.pi = self.data.true_propensity.to_numpy()
 
     def test_fit_returns_self(self):
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        result = model.fit(self.data.X, self.data.treatment, self.data.outcome)
+        model = _make_model()
+        result = model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert result is model
 
     def test_is_fitted_after_fit(self):
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome)
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert model._is_fitted
 
     def test_repr_fitted(self):
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome)
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert "fitted" in repr(model)
 
     def test_feature_names_stored(self):
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome)
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert model._feature_names == list(self.data.X.columns)
 
     def test_n_train_stored(self):
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome)
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert model._n_train == len(self.data.X)
 
     def test_fit_with_external_propensity(self):
-        pi = self.data.true_propensity.to_numpy()
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=pi)
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert model._is_fitted
-        np.testing.assert_array_equal(model.propensity_scores, pi)
+        np.testing.assert_array_equal(model.propensity_scores, self.pi)
 
     def test_fit_continuous_outcome(self):
         data = simulate_continuous_outcome(n_policies=100, random_seed=5)
-        model = BayesianCausalForest(outcome="continuous", num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(data.X, data.treatment, data.outcome)
+        pi = data.true_propensity.to_numpy()
+        model = _make_model(outcome="continuous")
+        model.fit(data.X, data.treatment, data.outcome, propensity=pi)
         assert model._is_fitted
 
     def test_fit_with_groups(self):
-        groups = pd.Series(
-            np.random.randint(1, 4, len(self.data.X)),
-            name="insurer_id"
-        )
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        # Groups trigger rfx_group_ids in BCF — mock supports it
-        model.fit(self.data.X, self.data.treatment, self.data.outcome, groups=groups)
+        rng = np.random.default_rng(0)
+        groups = pd.Series(rng.integers(1, 4, len(self.data.X)), name="insurer_id")
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome,
+                  propensity=self.pi, groups=groups)
         assert model._is_fitted
 
     def test_fit_twice(self):
         """Fitting twice should re-fit (no stale state)."""
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=3, random_seed=0)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome)
-        model.fit(self.data.X, self.data.treatment, self.data.outcome)
+        model = _make_model()
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
+        model.fit(self.data.X, self.data.treatment, self.data.outcome, propensity=self.pi)
         assert model._is_fitted
 
 
@@ -224,7 +231,7 @@ class TestPositivityCheck:
     def test_positivity_violation_raises(self):
         """Extreme propensity scores should raise PositivityViolationError."""
         data = simulate_renewal(SimulationParams(n_policies=200, random_seed=0))
-        # Force extreme propensities
+        # Force extreme propensities for > 5% of policies
         bad_pi = np.full(200, 0.5)
         bad_pi[:20] = 0.01  # 10% below threshold
         with pytest.raises(PositivityViolationError):
@@ -258,23 +265,22 @@ class TestGIPPBreakWarning:
         X = data.X.copy()
         # Add date column spanning Jan 2022
         X["renewal_date"] = pd.date_range("2021-06-01", periods=100, freq="ME")
+        pi = data.true_propensity.to_numpy()
 
         with pytest.warns(GIPPBreakWarning):
-            model = BayesianCausalForest(num_mcmc=10, num_gfr=2)
-            model.fit(
-                X, data.treatment, data.outcome,
-                gipp_date_col="renewal_date"
-            )
+            model = _make_model()
+            model.fit(X, data.treatment, data.outcome, gipp_date_col="renewal_date", propensity=pi)
 
     def test_no_warn_when_post_gipp(self):
         data = simulate_renewal(SimulationParams(n_policies=100, random_seed=0))
         X = data.X.copy()
         X["renewal_date"] = pd.date_range("2022-03-01", periods=100, freq="ME")
+        pi = data.true_propensity.to_numpy()
 
         with warnings.catch_warnings(record=True) as w:
             warnings.simplefilter("always")
-            model = BayesianCausalForest(num_mcmc=10, num_gfr=2)
-            model.fit(X, data.treatment, data.outcome, gipp_date_col="renewal_date")
+            model = _make_model()
+            model.fit(X, data.treatment, data.outcome, gipp_date_col="renewal_date", propensity=pi)
 
         gipp_warns = [x for x in w if issubclass(x.category, GIPPBreakWarning)]
         assert len(gipp_warns) == 0
@@ -355,7 +361,6 @@ class TestPosteriorSamples:
         result = fitted_model.posterior_samples(small_dataset.X)
         n = len(small_dataset.X)
         assert result.shape[0] == n
-        # second dim = n_mcmc samples
         assert result.ndim == 2
 
     def test_no_nan_in_output(self, fitted_model, small_dataset):
@@ -387,8 +392,6 @@ class TestSerialisation:
     def test_from_json_can_predict(self, fitted_model, small_dataset):
         json_str = fitted_model.to_json()
         model2 = BayesianCausalForest.from_json(json_str, outcome="binary")
-        # from_json sets is_fitted but not feature_names — just check no crash
-        # (feature validation is skipped if feature_names is empty)
         result = model2.cate(small_dataset.X)
         assert isinstance(result, pd.DataFrame)
 
@@ -430,7 +433,8 @@ class TestConvergenceSummary:
 
     def test_single_chain_note(self):
         data = simulate_renewal(SimulationParams(n_policies=100, random_seed=0))
-        model = BayesianCausalForest(num_mcmc=20, num_gfr=2, num_chains=1)
-        model.fit(data.X, data.treatment, data.outcome)
+        pi = data.true_propensity.to_numpy()
+        model = _make_model(num_chains=1)
+        model.fit(data.X, data.treatment, data.outcome, propensity=pi)
         df = model.convergence_summary()
         assert "num_chains=1" in str(df.values) or "note" in df["parameter"].values

@@ -12,8 +12,9 @@ from insurance_bcf.simulate import SimulationParams, simulate_renewal
 @pytest.fixture(scope="module")
 def est_and_data():
     data = simulate_renewal(SimulationParams(n_policies=200, random_seed=10))
-    model = BayesianCausalForest(num_mcmc=30, num_gfr=3, random_seed=0)
-    model.fit(data.X, data.treatment, data.outcome)
+    pi = data.true_propensity.to_numpy()
+    model = BayesianCausalForest(num_mcmc=30, num_gfr=3, random_seed=0, positivity_max_fraction=0.30)
+    model.fit(data.X, data.treatment, data.outcome, propensity=pi)
     est = ElasticityEstimator(model)
     return est, data
 
